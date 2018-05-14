@@ -105,52 +105,58 @@ module Async =
             )
         |> Async.Parallel 
 
+module HashGenerator = 
 
-///return fileStream for the specified filepath
-///the fileStream should be disposed 
-let getStream(filePath) = 
-    new FileStream(filePath, FileMode.Open, FileAccess.Read)
+    ///return fileStream for the specified filepath
+    ///the fileStream should be disposed 
+    let private getStream(filePath) = 
+        new FileStream(filePath, FileMode.Open, FileAccess.Read)
 
 
-let readBytesFromFile filePath offset count =
-    async{
-        use stream  = getStream(filePath)
-        let a = Array.zeroCreate count
-        stream.Position <- offset
-        stream.Read(a, 0, count) |> ignore
+    let private readBytesFromFile filePath offset bytesToRead =
+        async{
+            use stream  = getStream(filePath)
+            let a = Array.zeroCreate bytesToRead
+            stream.Position <- offset
+            stream.Read(a, 0, bytesToRead) |> ignore
+            stream.Dispose()
+            stream.Close()
+            return offset, MD5Cng.Create().ComputeHash(a)
+        }
+
+    ///using recursion build a list of async tasks
+    ///use generateListOfAsyncTasks instead
+    let rec private generateListOfAsyncTasksRecursively filePath (streamLength:int64) bytesToRead offset asyncList = 
+        match streamLength with
+        | l when l > int64(offset) -> 
+            (readBytesFromFile filePath offset bytesToRead)::asyncList
+            |> generateListOfAsyncTasksRecursively filePath streamLength bytesToRead (offset+int64(bytesToRead))
+        |_ -> asyncList
+
+    ///build a list of async tasks splitting the source file into 1 MB chucks
+    let private generateListOfAsyncTasks filePath  =
+        use stream = getStream(filePath)
+        let streamLength = stream.Length
         stream.Dispose()
         stream.Close()
-        return offset, MD5Cng.Create().ComputeHash(a)
-    }
+        generateListOfAsyncTasksRecursively filePath streamLength 1000000 0L []
+    
+    ///generate hash for the specified file
+    let computeHash filePath timeout = 
 
-
-let rec generateListOfAsyncTasks filePath (length:int64) count offset asyncList = 
-    match length with
-    | l when l > int64(offset) -> 
-        (readBytesFromFile filePath offset count)::asyncList
-        |> generateListOfAsyncTasks filePath length count (offset+int64(count))
-    |_ -> asyncList
-
-
-
-let processFile filePath = 
-    use stream = getStream(filePath)
-    let length = stream.Length
-    stream.Dispose()
-    stream.Close()
-
-    let x = 
-        generateListOfAsyncTasks filePath length 1000000 0L []
-        |> Async.ParallelWithThrottle 600000 //current timeout - 6 minutes
-        |> Async.RunSynchronously
-        |> Array.sortBy (fun (n,_) -> n)
-        |> Array.map (fun (_,s) -> s)
-        |> Array.concat
+        let x = 
+            generateListOfAsyncTasks filePath
+            |> Async.ParallelWithThrottle timeout
+            |> Async.RunSynchronously
+            |> Array.sortBy (fun (n,_) -> n)
+            |> Array.map (fun (_,s) -> s)
+            |> Array.concat
     
     
-    printfn "%A" (MD5.Create().ComputeHash(x))
+        printfn "%A" (MD5.Create().ComputeHash(x))
 
 open ParseCommandLineArgs
+open HashGenerator
 
 [<EntryPoint>]
 let main argv = 
@@ -166,7 +172,7 @@ let main argv =
             printfn "%A > %s" (System.DateTime.Now)
 
         print ("Started processing file \"" + path + "\"") 
-        processFile path
+        computeHash path 600000 //current timeout - 6 minutes
         print "finished"
 
     | None -> 
