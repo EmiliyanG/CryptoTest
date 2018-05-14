@@ -68,31 +68,53 @@ module ParseCommandLineArgs =
 
 module Async =
     open System.Threading
-    let inline ParallelWithThrottle (millisecondsTimeout:int) (limit:int) (operations:Async<'b> seq) =
-        let semaphore = new System.Threading.SemaphoreSlim(limit, limit)
-        let mutable count = (operations |> Seq.length) 
-        operations 
-        |> Seq.map(fun op -> async {
-                let! isHandleAquired = Async.AwaitTask <| semaphore.WaitAsync(millisecondsTimeout=millisecondsTimeout)
-                if isHandleAquired then 
-                    try
-                        return! op
-                    finally 
-                        if Interlocked.Decrement(&count) = 0 then
-                            semaphore.Dispose()
-                        else semaphore.Release() |> ignore
-                else return! failwith "Failled to aquire handle" })
+
+    ///use a Semaphore to implement the concept of threads throttling. 
+    ///At any point of time only a fixed number (equal to the available environment's processors) of threads are allowed to run.
+    let inline ParallelWithThrottle millisecondsTimeout (threads:Async<'b> seq) =
+        let threadsLimit = Environment.ProcessorCount
+        let semaphore = new System.Threading.SemaphoreSlim(threadsLimit, threadsLimit)
+
+        let mutable threadsCount = threads |> Seq.length 
+
+        threads 
+        |> Seq.map(
+            fun thread -> 
+                async {
+                    
+                    // try entering the semaphore 
+                    let! isHandleAquired = 
+                        semaphore.WaitAsync(millisecondsTimeout = millisecondsTimeout)
+                        |> Async.AwaitTask
+
+                    match isHandleAquired with
+                    | true -> //allowed to enter the semaphore 
+                        try
+                            return! thread
+                        finally 
+                            //calculate the count of remaining threads waiting to enter the semaphore
+                            //As the threadsCount will be shared between multiple threads decrement the count using atomic operation
+                            let remainingThreadsCount = Interlocked.Decrement(ref threadsCount)
+                            match remainingThreadsCount with
+                            | 0 -> semaphore.Dispose()
+                            | _ -> semaphore.Release() |> ignore
+                            
+                    | false -> //could not enter the semaphore within the specified timeout
+                        return! failwith "Failled to aquire handle" 
+                }
+            )
         |> Async.Parallel 
 
 
-
-let getStream(s) = 
-    new FileStream(s, FileMode.Open, FileAccess.Read)
+///return fileStream for the specified filepath
+///the fileStream should be disposed 
+let getStream(filePath) = 
+    new FileStream(filePath, FileMode.Open, FileAccess.Read)
 
 
 let readBytesFromFile filePath offset count =
     async{
-        let stream  = getStream(filePath)
+        use stream  = getStream(filePath)
         let a = Array.zeroCreate count
         stream.Position <- offset
         stream.Read(a, 0, count) |> ignore
@@ -111,14 +133,15 @@ let rec generateListOfAsyncTasks filePath (length:int64) count offset asyncList 
 
 
 
-let processFile s = 
-    let stream = getStream(s)
+let processFile filePath = 
+    use stream = getStream(filePath)
     let length = stream.Length
     stream.Dispose()
+    stream.Close()
 
     let x = 
-        generateListOfAsyncTasks s length 1000000 0L []
-        |> Async.ParallelWithThrottle 600000 4  //current timeout - 6 minutes
+        generateListOfAsyncTasks filePath length 1000000 0L []
+        |> Async.ParallelWithThrottle 600000 //current timeout - 6 minutes
         |> Async.RunSynchronously
         |> Array.sortBy (fun (n,_) -> n)
         |> Array.map (fun (_,s) -> s)
@@ -138,12 +161,12 @@ let main argv =
         |> parseCommandLineArguments
 
     match a.filePath with
-    | Some p -> 
+    | Some path -> 
         let print = 
             printfn "%A > %s" (System.DateTime.Now)
 
-        print ("Started processing file \"" + p + "\"") 
-        processFile p
+        print ("Started processing file \"" + path + "\"") 
+        processFile path
         print "finished"
 
     | None -> 
